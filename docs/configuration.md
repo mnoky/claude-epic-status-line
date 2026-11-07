@@ -118,6 +118,23 @@ CESL_SHOW_SCOPED=0
 CESL_SHOW_EXTRA=0
 ```
 
+## LiteLLM key budget
+
+Behind a [LiteLLM](https://docs.litellm.ai) gateway, Claude Code reports no rate limits and a virtual key often cannot read its own `/key/info`. Turn on the budget row to see the key's spend against its max budget:
+
+```
+budget  ███░░░░░░░ $37.50/$125.00 (30%)
+```
+
+The figures come from the `x-litellm-key-spend` and `x-litellm-key-max-budget` response headers of a chat completion with an empty `messages` list. LiteLLM rejects it (HTTP 400) before any model is called, so the query costs nothing. The result is cached for `CESL_CACHE_TTL` seconds, shared across sessions. A key with no budget shows its spend alone.
+
+| Variable             | Default                                            | Description                                         |
+| -------------------- | -------------------------------------------------- | --------------------------------------------------- |
+| `CESL_SHOW_LITELLM`  | `0`                                                | `1` shows the budget row                            |
+| `CESL_LITELLM_URL`   | `$ANTHROPIC_BASE_URL`                              | Gateway base URL (a trailing `/v1` is accepted)     |
+| `CESL_LITELLM_KEY`   | `$ANTHROPIC_AUTH_TOKEN`, else `$ANTHROPIC_API_KEY` | LiteLLM virtual key                                 |
+| `CESL_LITELLM_MODEL` | `claude-haiku-4-5`                                 | Model named in the probe request (any routed model) |
+
 ## Colour control
 
 | Variable     | Default | Description                                                                   |

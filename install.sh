@@ -110,6 +110,15 @@ else
 #CESL_SHOW_EXTRA=1
 #CESL_SHOW_PROJECTION=1
 
+## LiteLLM key budget row (opt-in): "budget ███░░ $22.04/$125.00 (17%)".
+## Reads the x-litellm-key-spend / -max-budget headers of a zero-cost request
+## (empty messages, rejected before any model is called). URL and key default
+## to ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY).
+#CESL_SHOW_LITELLM=0
+#CESL_LITELLM_URL=
+#CESL_LITELLM_KEY=
+#CESL_LITELLM_MODEL=claude-haiku-4-5
+
 ## Palette
 #CESL_COLOR_TEXT='220;220;220'
 #CESL_COLOR_OK='0;175;80'

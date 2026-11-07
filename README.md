@@ -36,6 +36,7 @@ _Click to play, or [watch it on the documentation site](https://dsebastien.githu
 | **Rate limits**          | `█░` progress bars for 5-hour, 7-day, per-model, and extra usage with reset times                                         |
 | **Pace projection**      | `⇢ 94%` — where the 5-hour / 7-day window lands at the current burn rate                                                  |
 | **Context hint**         | One line naming the right command: `/compact` for a full window, `/clear` for an expensive one                            |
+| **LiteLLM budget**       | `budget █░ $24.18/$125.00 (19%)` — key spend vs. max budget behind a LiteLLM gateway (opt-in, `CESL_SHOW_LITELLM=1`)      |
 
 ### Color coding
 

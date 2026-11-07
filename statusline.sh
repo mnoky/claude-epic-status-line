@@ -77,6 +77,13 @@ _cesl_cfg="${CESL_CONFIG:-$HOME/.config/claude-epic-status-line/config.sh}"
 : "${CESL_SHOW_EXTRA:=1}"
 # Projected end-of-window utilization on the 5-hour / 7-day rows
 : "${CESL_SHOW_PROJECTION:=1}"
+# LiteLLM key budget row (opt-in): spend/budget read from the x-litellm-key-*
+# headers of a zero-cost rejected request to the gateway. URL and key default
+# to ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN (or ANTHROPIC_API_KEY)
+: "${CESL_SHOW_LITELLM:=0}"
+: "${CESL_LITELLM_URL:=${ANTHROPIC_BASE_URL:-}}"
+: "${CESL_LITELLM_KEY:=${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}}"
+: "${CESL_LITELLM_MODEL:=claude-haiku-4-5}"
 # Absolute context thresholds, in tokens. A percentage hides what a turn costs:
 # 486k of a 1M window reads as a comfortable 49% while costing 48k every turn (at a 10% cache-read rate).
 : "${CESL_CTX_WARN:=60000}"
@@ -783,6 +790,118 @@ if [ "$usage_needed" = "1" ]; then
     fi
 fi
 
+# ── LiteLLM key budget (cached; opt-in) ─────────────────────────────
+# A chat completion with an empty messages list is rejected by LiteLLM (HTTP
+# 400) before any model is called, yet the response still carries the key's
+# spend and max budget headers — a free budget query for keys that cannot
+# reach the /key/info admin endpoint.
+ll_spend=""
+ll_budget=""
+ll_state="disabled"
+ll_valid() { # "spend<TAB>budget" -> 0 when spend is a number and budget a number or "-"
+    awk -F'\t' 'NR == 1 && NF == 2 && $1 ~ /^[0-9]+(\.[0-9]+)?$/ && $2 ~ /^(-|[0-9]+(\.[0-9]+)?)$/ { ok = 1 }
+        END { exit !ok }' 2>/dev/null
+}
+
+if [ "$CESL_SHOW_LITELLM" = "1" ]; then
+    ll_url="${CESL_LITELLM_URL%/}"
+    ll_url="${ll_url%/v1}"
+    ll_key="$CESL_LITELLM_KEY"
+    ll_model="$CESL_LITELLM_MODEL"
+    # The key goes into a curl config line and the model into a JSON body:
+    # refuse anything that could break out of either
+    case "$ll_key" in *[!A-Za-z0-9._~+/=-]*) ll_key="" ;; esac
+    case "$ll_model" in ''|*[!A-Za-z0-9._:/@-]*) ll_model="claude-haiku-4-5" ;; esac
+    case "$ll_url" in http://*|https://*) ;; *) ll_url="" ;; esac
+    case "$ll_url" in *[!A-Za-z0-9._~:/?#@%+=-]*) ll_url="" ;; esac
+
+    if [ -z "$ll_url" ] || [ -z "$ll_key" ]; then
+        ll_state="no gateway URL or key (set CESL_LITELLM_URL / CESL_LITELLM_KEY)"
+    else
+        ll_state="no data"
+        mkdir -m 700 -p "$cache_dir" 2>/dev/null
+        ll_cache=""
+        if [ -d "$cache_dir" ] && [ ! -L "$cache_dir" ] && [ -O "$cache_dir" ]; then
+            # One cache per gateway + key, so switching keys never shows a stale budget
+            ll_id=$(printf '%s\n%s' "$ll_url" "$ll_key" | cksum | cut -d' ' -f1)
+            ll_cache="$cache_dir/litellm-$ll_id"
+        fi
+
+        ll_data=""
+        if [ -n "$ll_cache" ] && [ -f "$ll_cache" ]; then
+            ll_mtime=$(stat -c %Y "$ll_cache" 2>/dev/null || stat -f %m "$ll_cache" 2>/dev/null)
+            ll_age=$(( $(date +%s) - ${ll_mtime:-0} ))
+            if [ "$ll_age" -ge 0 ] 2>/dev/null && [ "$ll_age" -lt "$CESL_CACHE_TTL" ]; then
+                ll_data=$(head -c 256 "$ll_cache" 2>/dev/null)
+                printf '%s\n' "$ll_data" | ll_valid && ll_state="cached" || ll_data=""
+            fi
+        fi
+
+        if [ -z "$ll_data" ]; then
+            # Negative cache + single-flight lock, as for the usage API
+            ll_skip=false
+            ll_lock=""
+            if [ -n "$ll_cache" ]; then
+                if [ -f "$ll_cache.fail" ]; then
+                    fm_mtime=$(stat -c %Y "$ll_cache.fail" 2>/dev/null || stat -f %m "$ll_cache.fail" 2>/dev/null)
+                    [ $(( $(date +%s) - ${fm_mtime:-0} )) -lt "$CESL_CACHE_TTL" ] 2>/dev/null && ll_skip=true
+                fi
+                if ! $ll_skip; then
+                    ll_lock="$ll_cache.lock"
+                    if ! mkdir "$ll_lock" 2>/dev/null; then
+                        l_mtime=$(stat -c %Y "$ll_lock" 2>/dev/null || stat -f %m "$ll_lock" 2>/dev/null)
+                        if [ $(( $(date +%s) - ${l_mtime:-0} )) -gt 30 ] 2>/dev/null; then
+                            rm -rf "$ll_lock" 2>/dev/null
+                            mkdir "$ll_lock" 2>/dev/null || { ll_skip=true; ll_lock=""; }
+                        else
+                            ll_skip=true
+                            ll_lock=""
+                        fi
+                    fi
+                fi
+            fi
+
+            if ! $ll_skip; then
+                # Key goes to curl via stdin config, never on argv (procfs-visible)
+                ll_headers=$(printf 'header = "Authorization: Bearer %s"\n' "$ll_key" | curl -s --max-time 5 \
+                    -D - -o /dev/null \
+                    -H "Content-Type: application/json" \
+                    -d "{\"model\":\"${ll_model}\",\"messages\":[],\"max_tokens\":1}" \
+                    --config - \
+                    "${ll_url}/v1/chat/completions" 2>/dev/null | head -c 65536 | tr -d '\r')
+                ll_hspend=$(printf '%s\n' "$ll_headers" | sed -n 's/^[Xx]-[Ll]ite[Ll][Ll][Mm]-[Kk]ey-[Ss]pend: *//p' | tail -n 1)
+                ll_hbudget=$(printf '%s\n' "$ll_headers" | sed -n 's/^[Xx]-[Ll]ite[Ll][Ll][Mm]-[Kk]ey-[Mm]ax-[Bb]udget: *//p' | tail -n 1)
+                # A key without a budget reports "None": keep the spend, drop the meter
+                case "$ll_hbudget" in ''|*[!0-9.]*) ll_hbudget="-" ;; esac
+                ll_fresh=$(printf '%s\t%s' "${ll_hspend:0:24}" "${ll_hbudget:0:24}")
+                if printf '%s\n' "$ll_fresh" | ll_valid; then
+                    ll_data="$ll_fresh"
+                    ll_state="fetched"
+                    if [ -n "$ll_cache" ]; then
+                        printf '%s\n' "$ll_data" > "$ll_cache.$$" && mv -f "$ll_cache.$$" "$ll_cache"
+                        rm -f "$ll_cache.fail" 2>/dev/null
+                    fi
+                elif [ -n "$ll_cache" ]; then
+                    touch "$ll_cache.fail" 2>/dev/null
+                fi
+                [ -n "$ll_lock" ] && rmdir "$ll_lock" 2>/dev/null
+            fi
+
+            # Bounded stale grace (24h) after a failed or skipped refresh
+            if [ -z "$ll_data" ] && [ -n "$ll_cache" ] && [ -f "$ll_cache" ]; then
+                ll_mtime=$(stat -c %Y "$ll_cache" 2>/dev/null || stat -f %m "$ll_cache" 2>/dev/null)
+                ll_age=$(( $(date +%s) - ${ll_mtime:-0} ))
+                if [ "$ll_age" -ge 0 ] 2>/dev/null && [ "$ll_age" -lt 86400 ] 2>/dev/null; then
+                    ll_data=$(head -c 256 "$ll_cache" 2>/dev/null)
+                    printf '%s\n' "$ll_data" | ll_valid && ll_state="stale (${ll_age}s)" || ll_data=""
+                fi
+            fi
+        fi
+
+        [ -n "$ll_data" ] && IFS=$'\t' read -r ll_spend ll_budget <<< "$ll_data"
+    fi
+fi
+
 # ── Rate-limit block ────────────────────────────────────────────────
 rate_lines=""
 
@@ -868,6 +987,23 @@ if [ "$CESL_SHOW_RATE_BLOCK" = "1" ]; then
     fi
 fi
 
+# LiteLLM key budget: meter spend/budget (percent); spend alone when no budget
+if [ -n "$ll_spend" ]; then
+    ll_spend_fmt=$(awk -v v="$ll_spend" -v r="$CESL_CURRENCY_RATE" 'BEGIN {printf "%.2f", v * r}' 2>/dev/null)
+    if [ "$ll_budget" != "-" ] && awk -v b="$ll_budget" 'BEGIN { exit !(b > 0) }' 2>/dev/null; then
+        ll_budget_fmt=$(awk -v v="$ll_budget" -v r="$CESL_CURRENCY_RATE" 'BEGIN {printf "%.2f", v * r}' 2>/dev/null)
+        ll_pct_raw=$(awk -v s="$ll_spend" -v b="$ll_budget" 'BEGIN {printf "%d", s * 100 / b}' 2>/dev/null)
+        ll_pct=$(clamp_pct "$ll_pct_raw")
+        ll_rgb=$(state_rgb "$ll_pct")
+        ll_val="\033[38;2;${ll_rgb}m${CESL_CURRENCY_SYMBOL}${ll_spend_fmt}${reset}${dim}/${reset}${c_txt}${CESL_CURRENCY_SYMBOL}${ll_budget_fmt}${reset}"
+        ll_val+=" ${dim}(${reset}\033[38;2;${ll_rgb}m${ll_pct_raw}%${reset}${dim})${reset}"
+        rate_row "budget" "$ll_pct" none "" "$ll_val"
+    else
+        [ -n "$rate_lines" ] && rate_lines+="\n"
+        rate_lines+="${c_txt}budget ${reset} ${c_txt}${CESL_CURRENCY_SYMBOL}${ll_spend_fmt}${reset} ${dim}spent, no budget set${reset}"
+    fi
+fi
+
 # ── Context hint ────────────────────────────────────────────────────
 # Says what to do, and picks the right command: /compact reclaims room in a
 # window that is nearly full, /clear is the answer to a session that is merely
@@ -923,6 +1059,14 @@ if [ "$mode" = "explain" ]; then
         echo "no data (no token, API unreachable, or both CESL_SHOW_SCOPED and CESL_SHOW_EXTRA are 0)"
     fi
     echo "fetch needed: $usage_needed (scoped=$CESL_SHOW_SCOPED extra=$CESL_SHOW_EXTRA rate_block=$CESL_SHOW_RATE_BLOCK)"
+    echo
+    echo "== litellm budget =="
+    echo "state:        $ll_state (CESL_SHOW_LITELLM=$CESL_SHOW_LITELLM)"
+    if [ "$CESL_SHOW_LITELLM" = "1" ]; then
+        echo "gateway:      ${ll_url:-n/a}/v1/chat/completions (model $ll_model, key $([ -n "$ll_key" ] && echo set || echo missing))"
+        echo "cache:        ${ll_cache:-disabled} (ttl ${CESL_CACHE_TTL}s)"
+        echo "spend:        ${ll_spend:-n/a} | budget: ${ll_budget:-n/a}"
+    fi
     echo
     echo "== config =="
     set | grep '^CESL_' | sort
